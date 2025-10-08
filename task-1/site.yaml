@@ -1,0 +1,192 @@
+---
+- name: Развёртывание Hadoop 3.4.0
+  hosts: hadoop_all
+  become: true
+  gather_facts: false
+
+  vars:
+
+    jn_host: "tmpl-jn"
+    nn_host: "tmpl-nn"
+    dn_hosts:
+      - "tmpl-dn-00"
+      - "tmpl-dn-01"
+
+
+    hadoop_version: "3.4.0"
+    hadoop_tgz: "hadoop-3.4.0.tar.gz"
+    hadoop_url: "https://dlcdn.apache.org/hadoop/common/hadoop-{{ hadoop_version }}/{{ hadoop_tgz }}"
+    hadoop_home: "/home/hadoop/hadoop-{{ hadoop_version }}"
+    java_home: "/usr/lib/jvm/java-11-openjdk-amd64"
+
+
+    team_pubkey: "" # TO BE FILLED
+    hadoop_password_plain: "" # TO BE FILLED
+
+  tasks:
+    - name: Проверка подключаемся как team (см. inventory)
+      debug:
+        msg: "Подключаемся как team (см. inventory)."
+      changed_when: false
+
+    - name: Разрешить SSH для team по заданному публичному ключу
+      authorized_key:
+        user: team
+        key: "{{ team_pubkey }}"
+        state: present
+
+    - name: Убедиться, что каталог ~/.ssh у team существует и с правильными правами
+      file:
+        path: "/home/team/.ssh"
+        state: directory
+        owner: team
+        group: team
+        mode: "0700"
+
+    - name: Создать пользователя hadoop с домашним каталогом и единым паролем
+      user:
+        name: hadoop
+        shell: /bin/bash
+        create_home: true
+        password: "{{ hadoop_password_plain | password_hash('sha512') }}"
+
+    - name: Установить утилиты ACL (нужны для become_user на Linux)
+      package:
+        name: acl
+        state: present
+
+    - name: Прописать статические имена узлов в /etc/hosts на всех нодах
+      blockinfile:
+        path: /etc/hosts
+        create: yes
+        marker: "# {mark} ANSIBLE HADOOP HOSTS"
+        block: |
+          192.168.1.82 tmpl-jn
+          192.168.1.83 tmpl-nn
+          192.168.1.84 tmpl-dn-00
+          192.168.1.85 tmpl-dn-01
+
+    - name: Скачать архив Hadoop прямо в /home/hadoop (без /tmp и без локального кэша)
+      become_user: hadoop
+      ansible.builtin.get_url:
+        url: "{{ hadoop_url }}"
+        dest: "/home/hadoop/{{ hadoop_tgz }}"
+        mode: "0644"
+        force: false
+
+    - name: Создать каталог /home/hadoop/.ssh с корректными правами
+      file:
+        path: "/home/hadoop/.ssh"
+        state: directory
+        owner: hadoop
+        group: hadoop
+        mode: "0700"
+
+    - name: Сгенерировать ключ для hadoop на хосте запуска (tmpl-jn)
+      become_user: hadoop
+      openssh_keypair:
+        path: "/home/hadoop/.ssh/id_ed25519"
+        type: ed25519
+        owner: hadoop
+        group: hadoop
+        mode: "0600"
+        force: false
+      when: inventory_hostname == nn_host
+      register: hadoop_keypair_nn
+
+    - name: Разложить публичный ключ запускающего хоста (tmpl-nn) на все узлы
+      authorized_key:
+        user: hadoop
+        key: "{{ hostvars[nn_host].hadoop_keypair_nn.public_key }}"
+        state: present
+        manage_dir: true
+      when: hostvars[nn_host].hadoop_keypair_nn is defined
+
+    - name: Распаковать Hadoop на всех узлах в /home/hadoop
+      become_user: hadoop
+      unarchive:
+        src: "/home/hadoop/{{ hadoop_tgz }}"
+        dest: "/home/hadoop"
+        remote_src: true
+        creates: "{{ hadoop_home }}"
+
+    - name: Установить Java 11 (JDK) — требуется для Hadoop
+      package:
+        name: openjdk-11-jdk
+        state: present
+
+    - name: Экспортировать HADOOP_HOME, JAVA_HOME и PATH в ~/.profile (пользователь hadoop)
+      become_user: hadoop
+      blockinfile:
+        path: "/home/hadoop/.profile"
+        marker: "# {mark} ANSIBLE HADOOP ENV"
+        block: |
+          export HADOOP_HOME={{ hadoop_home }}
+          export JAVA_HOME={{ java_home }}
+          export PATH="$PATH:$HADOOP_HOME/bin:$HADOOP_HOME/sbin"
+
+    - name: Проверка — команда 'hadoop version' из-под пользователя hadoop
+      become_user: hadoop
+      shell: |
+        set -e
+        . /home/hadoop/.profile
+        hadoop version
+      register: hadoop_version_out
+      changed_when: false
+
+    - name: Прописать JAVA_HOME в hadoop-env.sh
+      lineinfile:
+        path: "{{ hadoop_home }}/etc/hadoop/hadoop-env.sh"
+        regexp: '^(#\s*)?export JAVA_HOME='
+        line: "export JAVA_HOME={{ java_home }}"
+        create: no
+        backup: yes
+
+    - name: Сгенерировать core-site.xml (Вариант А — дефолтный RPC порт NN 8020)
+      copy:
+        dest: "{{ hadoop_home }}/etc/hadoop/core-site.xml"
+        owner: hadoop
+        group: hadoop
+        mode: "0644"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <configuration>
+            <property>
+              <name>fs.defaultFS</name>
+              <value>hdfs://tmpl-nn:8020</value>
+            </property>
+          </configuration>
+
+    - name: Сгенерировать hdfs-site.xml (фактор репликации)
+      copy:
+        dest: "{{ hadoop_home }}/etc/hadoop/hdfs-site.xml"
+        owner: hadoop
+        group: hadoop
+        mode: "0644"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <configuration>
+            <property>
+              <name>dfs.replication</name>
+              <value>3</value>
+            </property>
+          </configuration>
+
+    - name: Сгенерировать список рабочих узлов (workers) — DataNodes и NN (если хотите DN на NN)
+      copy:
+        dest: "{{ hadoop_home }}/etc/hadoop/workers"
+        owner: hadoop
+        group: hadoop
+        mode: "0644"
+        content: |
+          tmpl-nn
+          tmpl-dn-00
+          tmpl-dn-01
+
+
+    - name: Форматировать HDFS (только на NameNode при первом запуске)
+      become_user: hadoop
+      shell: |
+        . /home/hadoop/.profile
+        hdfs namenode -format -force
+      when: inventory_hostname == nn_host
